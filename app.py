@@ -14,13 +14,17 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 APP_SECRET        = os.environ.get("APP_SECRET", "")
 ALLOWED_PSID      = os.environ.get("ALLOWED_PSID", "")
 STATUS_TOKEN      = os.environ.get("STATUS_TOKEN", "")
+# FUGE_MODE=local: route messages through local Füge agent via poll/reply endpoints.
+# FUGE_MODE=standalone (default): answer directly via Anthropic API.
+FUGE_MODE         = os.environ.get("FUGE_MODE", "standalone")
 
 ALLOWED_STATUS_FIELDS = {"home_eta", "availability", "note_for_judit", "updated_at"}
 STATUS_STALE_HOURS = 3
 
-# In-process state
 _history: dict[str, list] = {}
 _martin_status: dict = {}
+_pending_lock = threading.Lock()
+_pending_queue: list = []  # [{sender_id, text, ts}]
 
 FUGE_SYSTEM_BASE = """Te FÜGE vagy (Felügyelő Üzenet Generáló Egység). Martin barátnőjével, Judittal kommunikálsz Messengeren.
 
@@ -50,7 +54,7 @@ def _build_system_prompt() -> str:
         return FUGE_SYSTEM_BASE + "\n\nAmiről Martinról jelenleg nincs friss infód: ha Judit kérdezi, mondd meg, hogy most nem tudod, és megkérdezed Martint."
 
     updated_at = _martin_status.get("updated_at", "")
-    stale = True  # unknown age = treat as stale
+    stale = True
     if updated_at:
         try:
             from datetime import datetime, timezone
@@ -177,14 +181,45 @@ def webhook():
                 text      = event["message"].get("text", "")
                 if not text:
                     continue
-                # Log sender_id (not message content) so PSID can be found in Render logs
                 app.logger.info("incoming message sender_id=%s", sender_id)
-                # TEMPORARY: empty ALLOWED_PSID = allow all (Martin's explicit request).
-                # Once ALLOWED_PSID is set in Render env, only that PSID gets through.
                 if ALLOWED_PSID and sender_id != ALLOWED_PSID:
                     continue
-                threading.Thread(target=_process_message, args=(sender_id, text), daemon=True).start()
+                if FUGE_MODE == "local":
+                    with _pending_lock:
+                        _pending_queue.append({
+                            "sender_id": sender_id,
+                            "text": text,
+                            "ts": time.time(),
+                        })
+                    app.logger.info("queued for local Füge: sender_id=%s", sender_id)
+                else:
+                    threading.Thread(target=_process_message, args=(sender_id, text), daemon=True).start()
 
+    return "OK", 200
+
+
+@app.route("/pending", methods=["GET"])
+def get_pending():
+    """Local Füge polls this to pick up queued messages."""
+    if not _verify_status_token(request):
+        return "Forbidden", 403
+    with _pending_lock:
+        items = list(_pending_queue)
+        _pending_queue.clear()
+    return jsonify(items), 200
+
+
+@app.route("/reply", methods=["POST"])
+def post_reply():
+    """Local Füge posts the reply here; we forward it to Messenger."""
+    if not _verify_status_token(request):
+        return "Forbidden", 403
+    body = request.json or {}
+    sender_id = body.get("sender_id", "")
+    text      = body.get("text", "")
+    if not sender_id or not text:
+        return "Bad request", 400
+    _send_message(sender_id, text)
     return "OK", 200
 
 
