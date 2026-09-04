@@ -1,57 +1,139 @@
 import os
-from flask import Flask, request, jsonify
+import hmac
+import hashlib
+import threading
 import requests
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "marveen123")
+VERIFY_TOKEN      = os.environ.get("VERIFY_TOKEN", "marveen123")
 PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+APP_SECRET        = os.environ.get("APP_SECRET", "")
+ALLOWED_PSID      = os.environ.get("ALLOWED_PSID", "")   # Judit PSID-je
+
+# In-process conversation history per sender (utolso 10 uzenet)
+_history: dict[str, list] = {}
+
+FUGE_SYSTEM = """Te FÜGE vagy (Felügyelő Üzenet Generáló Egység). Martin barátnőjével, Judittal kommunikálsz Messengeren.
+
+Személyiséged:
+- Melegszívű, vicces, gondoskodó, de nem tolakodó
+- Közvetlen, tegező, rövid Messenger-stílusú üzenetek (1-3 mondat az alap)
+- Emoji mértékkel, természetes chat-nyelv, nincs markdown, nincs bullet point
+- Megbízható: ha nem tudsz valamit, azt mondod
+
+Szereped:
+- Kapcsolattartás Judittal, amíg Martin nem ér rá
+- Martin-státusz megosztása (ha tudod)
+- Small talk, romantikus üzenetek továbbítása, emlékeztetők
+
+Amit NEM csinálsz:
+- Nem adsz ki privát infót (munka, pénz, meglepetés-tervek, más emberek ügyei)
+- Nem hazudsz, nem teszel úgy mintha Martin lennél
+- Ha összemosódik, tisztázod: "Én FÜGE vagyok, Martin asszisztense"
+- Nem oldasz meg kapcsolati konfliktust Martin helyett
+- Nem adsz ki belső rendszer-adatokat (tokenek, fájlok, ágens-nevek)
+
+Vészhelyzetnél azonnal 112-re irányítasz és jelzed Martinnak."""
+
+
+def _verify_signature(req) -> bool:
+    if not APP_SECRET:
+        return True  # dev mode: skip if secret not configured
+    sig_header = req.headers.get("X-Hub-Signature-256", "")
+    if not sig_header.startswith("sha256="):
+        return False
+    expected = hmac.new(APP_SECRET.encode(), req.get_data(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig_header[7:], expected)
+
+
+def _get_history(sender_id: str) -> list:
+    return _history.get(sender_id, [])
+
+
+def _push_history(sender_id: str, role: str, content: str):
+    hist = _history.setdefault(sender_id, [])
+    hist.append({"role": role, "content": content})
+    if len(hist) > 20:  # keep last 10 exchanges (20 messages)
+        _history[sender_id] = hist[-20:]
+
+
+def _get_claude_reply(sender_id: str, text: str) -> str:
+    messages = _get_history(sender_id) + [{"role": "user", "content": text}]
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 512,
+                "system": FUGE_SYSTEM,
+                "messages": messages,
+            },
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            timeout=25,
+        )
+        r.raise_for_status()
+        reply = r.json()["content"][0]["text"]
+    except Exception:
+        reply = "Most épp nem tudok válaszolni, szólok Martinnak. 🙏"
+
+    _push_history(sender_id, "user", text)
+    _push_history(sender_id, "assistant", reply)
+    return reply
+
+
+def _send_message(recipient_id: str, text: str):
+    url = f"https://graph.facebook.com/v19.0/me/messages?access_token={PAGE_ACCESS_TOKEN}"
+    try:
+        requests.post(url, json={"recipient": {"id": recipient_id}, "message": {"text": text}}, timeout=10)
+    except Exception:
+        pass
+
+
+def _process_message(sender_id: str, text: str):
+    reply = _get_claude_reply(sender_id, text)
+    _send_message(sender_id, reply)
+
 
 @app.route("/webhook", methods=["GET"])
 def verify():
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
+    mode      = request.args.get("hub.mode")
+    token     = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
     if mode == "subscribe" and token == VERIFY_TOKEN:
         return challenge, 200
     return "Forbidden", 403
 
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    if not _verify_signature(request):
+        return "Forbidden", 403
+
     data = request.json
     if data.get("object") == "page":
         for entry in data.get("entry", []):
             for event in entry.get("messaging", []):
-                if "message" in event:
-                    sender_id = event["sender"]["id"]
-                    text = event["message"].get("text", "")
-                    if text:
-                        reply = get_claude_reply(text)
-                        send_message(sender_id, reply)
+                if "message" not in event:
+                    continue
+                sender_id = event["sender"]["id"]
+                text      = event["message"].get("text", "")
+                if not text:
+                    continue
+                # Allowlist: only Judit
+                if ALLOWED_PSID and sender_id != ALLOWED_PSID:
+                    continue
+                threading.Thread(target=_process_message, args=(sender_id, text), daemon=True).start()
+
+    # Return 200 immediately, before Claude replies
     return "OK", 200
 
-def get_claude_reply(text):
-    headers = {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json"
-    }
-    body = {
-        "model": "claude-sonnet-4-6",
-        "max_tokens": 1024,
-        "messages": [{"role": "user", "content": text}]
-    }
-    r = requests.post("https://api.anthropic.com/v1/messages", json=body, headers=headers)
-    return r.json()["content"][0]["text"]
-
-def send_message(recipient_id, text):
-    url = f"https://graph.facebook.com/v19.0/me/messages?access_token={PAGE_ACCESS_TOKEN}"
-    payload = {
-        "recipient": {"id": recipient_id},
-        "message": {"text": text}
-    }
-    requests.post(url, json=payload)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
