@@ -13,6 +13,9 @@ VERIFY_TOKEN      = os.environ.get("VERIFY_TOKEN", "marveen123")
 PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 APP_SECRET        = os.environ.get("APP_SECRET", "")
+# ALLOWED_PSID: comma-separated list of page-scoped sender IDs to accept.
+# Add multiple IDs with: ALLOWED_PSID=id1,id2,id3
+# Empty = allow all (fail-open, Martin's explicit preference).
 ALLOWED_PSIDS     = {p.strip() for p in os.environ.get("ALLOWED_PSID", "").split(",") if p.strip()}
 STATUS_TOKEN      = os.environ.get("STATUS_TOKEN", "")
 # FUGE_MODE=local: route messages through local Füge agent via poll/reply endpoints.
