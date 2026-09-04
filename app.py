@@ -184,15 +184,20 @@ def webhook():
                 app.logger.info("incoming message sender_id=%s", sender_id)
                 if ALLOWED_PSID and sender_id != ALLOWED_PSID:
                     continue
+                # Always queue a notification so local poll can alert Martin.
+                with _pending_lock:
+                    _pending_queue.append({
+                        "type": "notification",
+                        "sender_id": sender_id,
+                        "text": text,
+                        "ts": time.time(),
+                    })
+
                 if FUGE_MODE == "local":
-                    with _pending_lock:
-                        _pending_queue.append({
-                            "sender_id": sender_id,
-                            "text": text,
-                            "ts": time.time(),
-                        })
+                    # Local Füge handles the reply via poll.
                     app.logger.info("queued for local Füge: sender_id=%s", sender_id)
                 else:
+                    # Standalone: Render answers directly AND notification is queued above.
                     threading.Thread(target=_process_message, args=(sender_id, text), daemon=True).start()
 
     return "OK", 200
