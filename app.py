@@ -3,6 +3,7 @@ import hmac
 import hashlib
 import threading
 import time
+import collections
 import requests
 from flask import Flask, request, jsonify
 
@@ -25,6 +26,7 @@ _history: dict[str, list] = {}
 _martin_status: dict = {}
 _pending_lock = threading.Lock()
 _pending_queue: list = []  # [{sender_id, text, ts}]
+_seen_mids: collections.deque = collections.deque(maxlen=200)  # dedup message IDs
 
 FUGE_SYSTEM_BASE = """Te FÜGE vagy (Felügyelő Üzenet Generáló Egység). Martin barátnőjével, Judittal kommunikálsz Messengeren.
 
@@ -178,10 +180,17 @@ def webhook():
                 if "message" not in event:
                     continue
                 sender_id = event["sender"]["id"]
+                mid       = event["message"].get("mid", "")
                 text      = event["message"].get("text", "")
                 if not text:
                     continue
-                app.logger.info("incoming message sender_id=%s", sender_id)
+                # Dedup: mark mid seen immediately (before reply generation) so retries are dropped.
+                if mid:
+                    if mid in _seen_mids:
+                        app.logger.info("duplicate mid=%s, skipping", mid)
+                        continue
+                    _seen_mids.append(mid)
+                app.logger.info("incoming message sender_id=%s mid=%s", sender_id, mid)
                 if ALLOWED_PSID and sender_id != ALLOWED_PSID:
                     continue
                 # Always queue a notification so local poll can alert Martin.
