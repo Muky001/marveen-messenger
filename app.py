@@ -50,10 +50,10 @@ def _build_system_prompt() -> str:
         return FUGE_SYSTEM_BASE + "\n\nAmiről Martinról jelenleg nincs friss infód: ha Judit kérdezi, mondd meg, hogy most nem tudod, és megkérdezed Martint."
 
     updated_at = _martin_status.get("updated_at", "")
-    stale = False
+    stale = True  # unknown age = treat as stale
     if updated_at:
         try:
-            from datetime import datetime, timezone, timedelta
+            from datetime import datetime, timezone
             ts = datetime.fromisoformat(updated_at)
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
