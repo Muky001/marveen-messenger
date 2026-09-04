@@ -13,7 +13,7 @@ VERIFY_TOKEN      = os.environ.get("VERIFY_TOKEN", "marveen123")
 PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 APP_SECRET        = os.environ.get("APP_SECRET", "")
-ALLOWED_PSID      = os.environ.get("ALLOWED_PSID", "")
+ALLOWED_PSIDS     = {p.strip() for p in os.environ.get("ALLOWED_PSID", "").split(",") if p.strip()}
 STATUS_TOKEN      = os.environ.get("STATUS_TOKEN", "")
 # FUGE_MODE=local: route messages through local Füge agent via poll/reply endpoints.
 # FUGE_MODE=standalone (default): answer directly via Anthropic API.
@@ -195,7 +195,7 @@ def webhook():
                         continue
                     _seen_mids.append(mid)
                 app.logger.info("incoming message sender_id=%s mid=%s", sender_id, mid)
-                if ALLOWED_PSID and sender_id != ALLOWED_PSID:
+                if ALLOWED_PSIDS and sender_id not in ALLOWED_PSIDS:
                     continue
                 # Always queue a notification so local poll can alert Martin.
                 with _pending_lock:
