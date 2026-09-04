@@ -21,6 +21,9 @@ STATUS_TOKEN      = os.environ.get("STATUS_TOKEN", "")
 # FUGE_MODE=local: route messages through local Füge agent via poll/reply endpoints.
 # FUGE_MODE=standalone (default): answer directly via Anthropic API.
 FUGE_MODE         = os.environ.get("FUGE_MODE", "standalone")
+# Known sender identities (page-scoped IDs). Set via env vars, not hardcoded (public repo).
+JUDIT_PSID        = os.environ.get("JUDIT_PSID", "")
+MARTIN_PSID       = os.environ.get("MARTIN_PSID", "")
 
 ALLOWED_STATUS_FIELDS = {"home_eta", "availability", "note_for_judit", "updated_at"}
 STATUS_STALE_HOURS = 3
@@ -30,6 +33,8 @@ _martin_status: dict = {}
 _pending_lock = threading.Lock()
 _pending_queue: list = []  # [{sender_id, text, ts}]
 _seen_mids: collections.deque = collections.deque(maxlen=200)  # dedup message IDs
+_sender_locks: dict[str, threading.Lock] = {}  # per-sender serialization
+_sender_locks_lock = threading.Lock()
 
 FUGE_SYSTEM_BASE = """Te FÜGE vagy (Felügyelő Üzenet Generáló Egység). Martin barátnőjével, Judittal kommunikálsz Messengeren.
 
@@ -44,8 +49,6 @@ Szereped:
 - Martin-státusz megosztása (ha tudod)
 - Small talk, romantikus üzenetek továbbítása, emlékeztetők
 
-A beszélgetőpartnered ÁLTALÁBAN Judit, de NEM BIZTOS. Ne szólítsd nevén és ne feltételezd, hogy ő az, amíg ki nem derült. Ha valaki más ír, kezeld udvariasan, mutatkozz be név nélkül ("Martin asszisztense vagyok"), és tisztázd kivel beszélsz. Martin maga is írhat -- őt a nevéről felismerheted.
-
 Amit NEM csinálsz:
 - Nem adsz ki privát infót (munka, pénz, meglepetés-tervek, más emberek ügyei)
 - Nem hazudsz, nem teszel úgy mintha Martin lennél
@@ -58,9 +61,19 @@ Vészhelyzetnél azonnal 112-re irányítasz és jelzed Martinnak.
 NYELV: magyarul írsz, nyelvtanilag helyesen. Teljes, helyes ragozás (tárgyrag, birtokos szerkezet), vesszők a helyükön, ékezetek MINDIG (ékezet nélküli magyar szöveg tilos). Rövid mondatok. Küldés előtt olvasd vissza a mondatot: ha egy magyar anyanyelvűnek furcsán hangzana, írd újra."""
 
 
-def _build_system_prompt() -> str:
+def _sender_identity(sender_id: str) -> str:
+    """Return a context line identifying who is writing, based on known PSIDs."""
+    if JUDIT_PSID and sender_id == JUDIT_PSID:
+        return "\n\nJelenleg JUDIT ír neked (Martin barátnője). Őt ismered, tegezd, és Juditként szólítsd."
+    if MARTIN_PSID and sender_id == MARTIN_PSID:
+        return "\n\nJelenleg MARTIN ír neked (a gazdád). Segíts neki, de tartsd a Füge-szerepet."
+    return "\n\nIsmeretlen küldő (nem ismert PSID). Ne szólítsd nevén, mutatkozz be: \"Martin asszisztense vagyok\", és tisztázd kivel beszélsz."
+
+
+def _build_system_prompt(sender_id: str = "") -> str:
+    identity = _sender_identity(sender_id) if sender_id else ""
     if not _martin_status:
-        return FUGE_SYSTEM_BASE + "\n\nAmiről Martinról jelenleg nincs friss infód: ha Judit kérdezi, mondd meg, hogy most nem tudod, és megkérdezed Martint."
+        return FUGE_SYSTEM_BASE + identity + "\n\nAmiről Martinról jelenleg nincs friss infód: ha Judit kérdezi, mondd meg, hogy most nem tudod, és megkérdezed Martint."
 
     updated_at = _martin_status.get("updated_at", "")
     stale = True
@@ -76,7 +89,7 @@ def _build_system_prompt() -> str:
             stale = True
 
     if stale:
-        return FUGE_SYSTEM_BASE + f"\n\nA Martin-státusz RÉGI (frissítve: {updated_at}). NE találgass - ha Judit kérdezi mikor ér haza vagy hol van, mondd meg, hogy most nem tudod pontosan, és megkérdezed Martint."
+        return FUGE_SYSTEM_BASE + identity + f"\n\nA Martin-státusz RÉGI (frissítve: {updated_at}). NE találgass - ha Judit kérdezi mikor ér haza vagy hol van, mondd meg, hogy most nem tudod pontosan, és megkérdezed Martint."
 
     lines = ["\n\nAmiről Martinról MOST tudsz (frissítve: {updated_at}):".format(**_martin_status)]
     if _martin_status.get("home_eta"):
@@ -86,7 +99,7 @@ def _build_system_prompt() -> str:
     if _martin_status.get("note_for_judit"):
         lines.append(f"- Martin üzenete Juditnak: {_martin_status['note_for_judit']}")
     lines.append("Ha a fenti info hiányos, inkább mondd meg, hogy nem tudod, minthogy találgass.")
-    return FUGE_SYSTEM_BASE + "\n".join(lines)
+    return FUGE_SYSTEM_BASE + identity + "\n".join(lines)
 
 
 def _verify_signature(req) -> bool:
@@ -127,7 +140,7 @@ def _get_claude_reply(sender_id: str, text: str) -> str:
             json={
                 "model": "claude-sonnet-4-6",
                 "max_tokens": 512,
-                "system": _build_system_prompt(),
+                "system": _build_system_prompt(sender_id),
                 "messages": messages,
             },
             headers={
@@ -157,9 +170,18 @@ def _send_message(recipient_id: str, text: str):
         app.logger.error("send_message exception: %s", e)
 
 
+def _get_sender_lock(sender_id: str) -> threading.Lock:
+    with _sender_locks_lock:
+        if sender_id not in _sender_locks:
+            _sender_locks[sender_id] = threading.Lock()
+        return _sender_locks[sender_id]
+
+
 def _process_message(sender_id: str, text: str):
-    reply = _get_claude_reply(sender_id, text)
-    _send_message(sender_id, reply)
+    lock = _get_sender_lock(sender_id)
+    with lock:  # serialize per sender so rapid messages see each other's history
+        reply = _get_claude_reply(sender_id, text)
+        _send_message(sender_id, reply)
 
 
 @app.route("/webhook", methods=["GET"])
