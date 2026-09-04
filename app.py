@@ -2,6 +2,7 @@ import os
 import hmac
 import hashlib
 import threading
+import time
 import requests
 from flask import Flask, request, jsonify
 
@@ -11,12 +12,17 @@ VERIFY_TOKEN      = os.environ.get("VERIFY_TOKEN", "marveen123")
 PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 APP_SECRET        = os.environ.get("APP_SECRET", "")
-ALLOWED_PSID      = os.environ.get("ALLOWED_PSID", "")   # Judit PSID-je
+ALLOWED_PSID      = os.environ.get("ALLOWED_PSID", "")
+STATUS_TOKEN      = os.environ.get("STATUS_TOKEN", "")
 
-# In-process conversation history per sender (utolso 10 uzenet)
+ALLOWED_STATUS_FIELDS = {"home_eta", "availability", "note_for_judit", "updated_at"}
+STATUS_STALE_HOURS = 3
+
+# In-process state
 _history: dict[str, list] = {}
+_martin_status: dict = {}
 
-FUGE_SYSTEM = """Te FÜGE vagy (Felügyelő Üzenet Generáló Egység). Martin barátnőjével, Judittal kommunikálsz Messengeren.
+FUGE_SYSTEM_BASE = """Te FÜGE vagy (Felügyelő Üzenet Generáló Egység). Martin barátnőjével, Judittal kommunikálsz Messengeren.
 
 Személyiséged:
 - Melegszívű, vicces, gondoskodó, de nem tolakodó
@@ -39,14 +45,54 @@ Amit NEM csinálsz:
 Vészhelyzetnél azonnal 112-re irányítasz és jelzed Martinnak."""
 
 
+def _build_system_prompt() -> str:
+    if not _martin_status:
+        return FUGE_SYSTEM_BASE + "\n\nAmiről Martinról jelenleg nincs friss infód: ha Judit kérdezi, mondd meg, hogy most nem tudod, és megkérdezed Martint."
+
+    updated_at = _martin_status.get("updated_at", "")
+    stale = False
+    if updated_at:
+        try:
+            from datetime import datetime, timezone, timedelta
+            ts = datetime.fromisoformat(updated_at)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+            stale = age_hours > STATUS_STALE_HOURS
+        except Exception:
+            stale = True
+
+    if stale:
+        return FUGE_SYSTEM_BASE + f"\n\nA Martin-státusz RÉGI (frissítve: {updated_at}). NE találgass - ha Judit kérdezi mikor ér haza vagy hol van, mondd meg, hogy most nem tudod pontosan, és megkérdezed Martint."
+
+    lines = ["\n\nAmiről Martinról MOST tudsz (frissítve: {updated_at}):".format(**_martin_status)]
+    if _martin_status.get("home_eta"):
+        lines.append(f"- Hazaérkezés: {_martin_status['home_eta']}")
+    if _martin_status.get("availability"):
+        lines.append(f"- Állapot: {_martin_status['availability']}")
+    if _martin_status.get("note_for_judit"):
+        lines.append(f"- Martin üzenete Juditnak: {_martin_status['note_for_judit']}")
+    lines.append("Ha a fenti info hiányos, inkább mondd meg, hogy nem tudod, minthogy találgass.")
+    return FUGE_SYSTEM_BASE + "\n".join(lines)
+
+
 def _verify_signature(req) -> bool:
     if not APP_SECRET:
-        return False  # fail-closed: no secret = deny all
+        return False
     sig_header = req.headers.get("X-Hub-Signature-256", "")
     if not sig_header.startswith("sha256="):
         return False
     expected = hmac.new(APP_SECRET.encode(), req.get_data(), hashlib.sha256).hexdigest()
     return hmac.compare_digest(sig_header[7:], expected)
+
+
+def _verify_status_token(req) -> bool:
+    if not STATUS_TOKEN:
+        return False
+    auth = req.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return False
+    return hmac.compare_digest(auth[7:], STATUS_TOKEN)
 
 
 def _get_history(sender_id: str) -> list:
@@ -56,7 +102,7 @@ def _get_history(sender_id: str) -> list:
 def _push_history(sender_id: str, role: str, content: str):
     hist = _history.setdefault(sender_id, [])
     hist.append({"role": role, "content": content})
-    if len(hist) > 20:  # keep last 10 exchanges (20 messages)
+    if len(hist) > 20:
         _history[sender_id] = hist[-20:]
 
 
@@ -68,7 +114,7 @@ def _get_claude_reply(sender_id: str, text: str) -> str:
             json={
                 "model": "claude-sonnet-4-6",
                 "max_tokens": 512,
-                "system": FUGE_SYSTEM,
+                "system": _build_system_prompt(),
                 "messages": messages,
             },
             headers={
@@ -116,7 +162,7 @@ def verify():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     if not APP_SECRET:
-        app.logger.error("APP_SECRET not configured -- rejecting all requests")
+        app.logger.error("APP_SECRET not configured")
         return "Service unavailable", 503
     if not _verify_signature(request):
         return "Forbidden", 403
@@ -131,12 +177,22 @@ def webhook():
                 text      = event["message"].get("text", "")
                 if not text:
                     continue
-                # Allowlist: fail-closed (no ALLOWED_PSID = deny all)
                 if not ALLOWED_PSID or sender_id != ALLOWED_PSID:
                     continue
                 threading.Thread(target=_process_message, args=(sender_id, text), daemon=True).start()
 
-    # Return 200 immediately, before Claude replies
+    return "OK", 200
+
+
+@app.route("/status", methods=["POST"])
+def update_status():
+    if not _verify_status_token(request):
+        return "Forbidden", 403
+    body = request.json or {}
+    filtered = {k: v for k, v in body.items() if k in ALLOWED_STATUS_FIELDS}
+    _martin_status.clear()
+    _martin_status.update(filtered)
+    app.logger.info("status updated: %s", list(filtered.keys()))
     return "OK", 200
 
 
