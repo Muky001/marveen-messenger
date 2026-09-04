@@ -200,5 +200,25 @@ def update_status():
     return "OK", 200
 
 
+@app.route("/privacy", methods=["GET"])
+def privacy():
+    html = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Privacy Policy</title></head><body>
+<h1>Privacy Policy</h1>
+<p><strong>MarvBot001 Facebook Page Assistant</strong></p>
+<p>This application operates a Facebook Messenger bot (FÜGE) on behalf of MarvBot001 page.</p>
+<h2>Data collected</h2>
+<p>The bot receives text messages sent to the MarvBot001 Facebook Page via Messenger.
+Messages are processed in real-time to generate a response and are not stored permanently.</p>
+<h2>Data use</h2>
+<p>Message content is sent to the Anthropic API (Claude) solely to generate a reply.
+No message history is retained after the session ends.</p>
+<h2>Data sharing</h2>
+<p>We do not sell, share, or disclose user data to third parties except as required by Anthropic API processing.</p>
+<h2>Contact</h2>
+<p>For questions, contact the page administrator via Facebook.</p>
+</body></html>"""
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
