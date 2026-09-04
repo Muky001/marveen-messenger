@@ -177,7 +177,11 @@ def webhook():
                 text      = event["message"].get("text", "")
                 if not text:
                     continue
-                if not ALLOWED_PSID or sender_id != ALLOWED_PSID:
+                # Log sender_id (not message content) so PSID can be found in Render logs
+                app.logger.info("incoming message sender_id=%s", sender_id)
+                # TEMPORARY: empty ALLOWED_PSID = allow all (Martin's explicit request).
+                # Once ALLOWED_PSID is set in Render env, only that PSID gets through.
+                if ALLOWED_PSID and sender_id != ALLOWED_PSID:
                     continue
                 threading.Thread(target=_process_message, args=(sender_id, text), daemon=True).start()
 
