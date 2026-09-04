@@ -41,7 +41,7 @@ Vészhelyzetnél azonnal 112-re irányítasz és jelzed Martinnak."""
 
 def _verify_signature(req) -> bool:
     if not APP_SECRET:
-        return True  # dev mode: skip if secret not configured
+        return False  # fail-closed: no secret = deny all
     sig_header = req.headers.get("X-Hub-Signature-256", "")
     if not sig_header.startswith("sha256="):
         return False
@@ -91,9 +91,11 @@ def _get_claude_reply(sender_id: str, text: str) -> str:
 def _send_message(recipient_id: str, text: str):
     url = f"https://graph.facebook.com/v19.0/me/messages?access_token={PAGE_ACCESS_TOKEN}"
     try:
-        requests.post(url, json={"recipient": {"id": recipient_id}, "message": {"text": text}}, timeout=10)
-    except Exception:
-        pass
+        r = requests.post(url, json={"recipient": {"id": recipient_id}, "message": {"text": text}}, timeout=10)
+        if not r.ok:
+            app.logger.error("send_message failed: %s %s", r.status_code, r.text[:200])
+    except Exception as e:
+        app.logger.error("send_message exception: %s", e)
 
 
 def _process_message(sender_id: str, text: str):
@@ -113,6 +115,9 @@ def verify():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    if not APP_SECRET:
+        app.logger.error("APP_SECRET not configured -- rejecting all requests")
+        return "Service unavailable", 503
     if not _verify_signature(request):
         return "Forbidden", 403
 
@@ -126,8 +131,8 @@ def webhook():
                 text      = event["message"].get("text", "")
                 if not text:
                     continue
-                # Allowlist: only Judit
-                if ALLOWED_PSID and sender_id != ALLOWED_PSID:
+                # Allowlist: fail-closed (no ALLOWED_PSID = deny all)
+                if not ALLOWED_PSID or sender_id != ALLOWED_PSID:
                     continue
                 threading.Thread(target=_process_message, args=(sender_id, text), daemon=True).start()
 
