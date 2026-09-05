@@ -4,6 +4,7 @@ import hashlib
 import threading
 import time
 import collections
+import uuid
 import requests
 from flask import Flask, request, jsonify
 
@@ -36,7 +37,7 @@ _seen_mids: collections.deque = collections.deque(maxlen=200)  # dedup message I
 _sender_locks: dict[str, threading.Lock] = {}  # per-sender serialization
 _sender_locks_lock = threading.Lock()
 _spending_lock = threading.Lock()
-_spending_queue: list = []  # [{text, ts}] max 500 entries, in-memory only
+_spending_queue: list = []  # [{id, text, ts}] max 500 entries, ack-based
 
 FUGE_SYSTEM_BASE = """Te FÜGE vagy (Felügyelő Üzenet Generáló Egység). Martin barátnőjével, Judittal kommunikálsz Messengeren.
 
@@ -304,23 +305,40 @@ def spending_notify():
             text = f"[{title}] {msg}".strip()
     if not text:
         return "Bad request: missing text", 400
+    item_id = uuid.uuid4().hex
     with _spending_lock:
-        _spending_queue.append({"text": text, "ts": time.time()})
+        _spending_queue.append({"id": item_id, "text": text, "ts": time.time()})
         if len(_spending_queue) > 500:
             _spending_queue.pop(0)
-    app.logger.info("spending-notify queued: %s", text[:80])
-    return "OK", 200
+    app.logger.info("spending-notify queued id=%s: %s", item_id, text[:80])
+    return jsonify({"id": item_id}), 200
 
 
 @app.route("/spending-poll", methods=["GET"])
 def spending_poll():
-    """Local poller fetches and clears queued spending notifications."""
+    """Return unacked spending notifications without clearing (use /spending-ack to confirm)."""
     if not _verify_status_token(request):
         return "Forbidden", 403
     with _spending_lock:
         items = list(_spending_queue)
-        _spending_queue.clear()
     return jsonify(items), 200
+
+
+@app.route("/spending-ack", methods=["POST"])
+def spending_ack():
+    """Acknowledge processed items by ID; removes them from the queue."""
+    if not _verify_status_token(request):
+        return "Forbidden", 403
+    body = request.get_json(force=True, silent=True) or {}
+    ids = body.get("ids", [])
+    if isinstance(ids, str):
+        ids = [ids]
+    id_set = set(ids)
+    with _spending_lock:
+        before = len(_spending_queue)
+        _spending_queue[:] = [item for item in _spending_queue if item.get("id") not in id_set]
+        removed = before - len(_spending_queue)
+    return jsonify({"acked": removed}), 200
 
 
 @app.route("/privacy", methods=["GET"])
