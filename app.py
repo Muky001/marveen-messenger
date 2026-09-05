@@ -352,6 +352,7 @@ _location_lock = threading.Lock()
 _location_queue: list = []  # [{id, lat, lon, tst, acc, batt, vel, raw}] ack-based
 _location_total = 0
 _location_request_flag = threading.Event()  # set by /location-request, cleared on next OwnTracks POST
+_location_requested_at: "str | None" = None  # ISO UTC timestamp of last /location-request POST
 
 def _verify_location_token(req):
     """Returns True, 'not_configured', or False (wrong token)."""
@@ -389,7 +390,9 @@ def location_notify():
     # On-demand refresh: if a /location-request is pending, ask OwnTracks to send another fix immediately.
     cmd = []
     if _location_request_flag.is_set():
+        global _location_requested_at
         _location_request_flag.clear()
+        _location_requested_at = None
         cmd = [{"_type": "cmd", "action": "reportLocation"}]
     item_id = uuid.uuid4().hex
     item = {
@@ -413,15 +416,30 @@ def location_notify():
     return jsonify(cmd), 200  # OwnTracks expects JSON array; cmd is [] or [reportLocation]
 
 
+@app.route("/location-request", methods=["GET"])
+def location_request_status():
+    """Return whether an on-demand location request is currently pending."""
+    r = _verify_location_token(request)
+    if r is not True:
+        return _location_auth_response(r)
+    return jsonify({
+        "pending": _location_request_flag.is_set(),
+        "requested_at": _location_requested_at,
+    }), 200
+
+
 @app.route("/location-request", methods=["POST"])
 def location_request():
     """Request an immediate location fix from OwnTracks on its next POST to /location."""
     r = _verify_location_token(request)
     if r is not True:
         return _location_auth_response(r)
+    global _location_requested_at
+    from datetime import datetime, timezone
+    _location_requested_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     _location_request_flag.set()
-    app.logger.info("location-request queued")
-    return jsonify({"queued": True}), 200
+    app.logger.info("location-request queued at %s", _location_requested_at)
+    return jsonify({"queued": True, "requested_at": _location_requested_at}), 200
 
 
 @app.route("/location-poll", methods=["GET"])
