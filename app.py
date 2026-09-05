@@ -38,6 +38,7 @@ _sender_locks: dict[str, threading.Lock] = {}  # per-sender serialization
 _sender_locks_lock = threading.Lock()
 _spending_lock = threading.Lock()
 _spending_queue: list = []  # [{id, text, ts}] max 500 entries, ack-based
+_spending_total = 0  # monotonic counter, resets on restart (that's the signal)
 
 FUGE_SYSTEM_BASE = """Te FÜGE vagy (Felügyelő Üzenet Generáló Egység). Martin barátnőjével, Judittal kommunikálsz Messengeren.
 
@@ -305,23 +306,27 @@ def spending_notify():
             text = f"[{title}] {msg}".strip()
     if not text:
         return "Bad request: missing text", 400
+    global _spending_total
     item_id = uuid.uuid4().hex
     with _spending_lock:
+        _spending_total += 1
+        total = _spending_total
         _spending_queue.append({"id": item_id, "text": text, "ts": time.time()})
         if len(_spending_queue) > 500:
             _spending_queue.pop(0)
-    app.logger.info("spending-notify queued id=%s: %s", item_id, text[:80])
-    return jsonify({"id": item_id}), 200
+    app.logger.info("spending-notify queued id=%s total=%d: %s", item_id, total, text[:80])
+    return jsonify({"id": item_id, "total": total}), 200
 
 
 @app.route("/spending-poll", methods=["GET"])
 def spending_poll():
-    """Return unacked spending notifications without clearing (use /spending-ack to confirm)."""
+    """Return unacked spending notifications and total received count (use /spending-ack to confirm)."""
     if not _verify_status_token(request):
         return "Forbidden", 403
     with _spending_lock:
         items = list(_spending_queue)
-    return jsonify(items), 200
+        total = _spending_total
+    return jsonify({"items": items, "total": total}), 200
 
 
 @app.route("/spending-ack", methods=["POST"])
