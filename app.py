@@ -117,10 +117,14 @@ def _verify_signature(req) -> bool:
 def _verify_status_token(req) -> bool:
     if not STATUS_TOKEN:
         return False
+    # Accept Bearer header or ?token= query param (for apps that can't set headers)
     auth = req.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return False
-    return hmac.compare_digest(auth[7:], STATUS_TOKEN)
+    if auth.startswith("Bearer "):
+        return hmac.compare_digest(auth[7:], STATUS_TOKEN)
+    token_param = req.args.get("token", "")
+    if token_param:
+        return hmac.compare_digest(token_param, STATUS_TOKEN)
+    return False
 
 
 def _get_history(sender_id: str) -> list:
