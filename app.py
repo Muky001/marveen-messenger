@@ -19,6 +19,7 @@ APP_SECRET        = os.environ.get("APP_SECRET", "")
 # Empty = allow all (fail-open, Martin's explicit preference).
 ALLOWED_PSIDS     = {p.strip() for p in os.environ.get("ALLOWED_PSID", "").split(",") if p.strip()}
 STATUS_TOKEN      = os.environ.get("STATUS_TOKEN", "")
+LOCATION_TOKEN    = os.environ.get("LOCATION_TOKEN", "")  # separate token for /location endpoint
 # FUGE_MODE=local: route messages through local Füge agent via poll/reply endpoints.
 # FUGE_MODE=standalone (default): answer directly via Anthropic API.
 FUGE_MODE         = os.environ.get("FUGE_MODE", "standalone")
@@ -344,6 +345,81 @@ def spending_ack():
         before = len(_spending_queue)
         _spending_queue[:] = [item for item in _spending_queue if item.get("id") not in id_set]
         removed = before - len(_spending_queue)
+    return jsonify({"acked": removed}), 200
+
+
+_location_lock = threading.Lock()
+_location_queue: list = []  # [{id, lat, lon, tst, acc, batt, vel, raw}] ack-based
+_location_total = 0
+
+def _verify_location_token(req) -> bool:
+    if not LOCATION_TOKEN:
+        return False
+    auth = req.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return hmac.compare_digest(auth[7:], LOCATION_TOKEN)
+    token_param = req.args.get("token", "")
+    if token_param:
+        return hmac.compare_digest(token_param, LOCATION_TOKEN)
+    return False
+
+
+@app.route("/location", methods=["POST"])
+def location_notify():
+    """OwnTracks HTTP mode endpoint. Accepts _type=location payloads."""
+    if not _verify_location_token(request):
+        return "Forbidden", 403
+    global _location_total
+    body = request.get_json(force=True, silent=True) or {}
+    if body.get("_type") != "location":
+        return jsonify([]), 200  # OwnTracks expects [] response; non-location types silently ok
+    item_id = uuid.uuid4().hex
+    item = {
+        "id": item_id,
+        "lat": body.get("lat"),
+        "lon": body.get("lon"),
+        "tst": body.get("tst", int(time.time())),
+        "acc": body.get("acc"),
+        "batt": body.get("batt"),
+        "vel": body.get("vel"),
+        "tid": body.get("tid", ""),
+        "t": body.get("t", ""),
+        "raw": body,
+    }
+    with _location_lock:
+        _location_total += 1
+        _location_queue.append(item)
+        if len(_location_queue) > 1000:
+            _location_queue.pop(0)
+    app.logger.info("location queued id=%s lat=%.4f lon=%.4f", item_id, item["lat"] or 0, item["lon"] or 0)
+    return jsonify([]), 200  # OwnTracks expects JSON array response
+
+
+@app.route("/location-poll", methods=["GET"])
+def location_poll():
+    """Fetch unacked location points."""
+    if not _verify_location_token(request):
+        return "Forbidden", 403
+    with _location_lock:
+        items = list(_location_queue)
+        total = _location_total
+    return jsonify({"items": items, "total": total, "instance_id": _instance_id}), 200
+
+
+@app.route("/location-ack", methods=["POST"])
+def location_ack():
+    """Acknowledge processed location points by ID."""
+    if not _verify_location_token(request):
+        return "Forbidden", 403
+    body = request.get_json(force=True, silent=True) or {}
+    ids = body.get("ids", [])
+    if isinstance(ids, str):
+        ids = [ids]
+    id_set = set(ids)
+    with _location_lock:
+        before = len(_location_queue)
+        _location_queue[:] = [item for item in _location_queue if item.get("id") not in id_set]
+        removed = before - len(_location_queue)
     return jsonify({"acked": removed}), 200
 
 
