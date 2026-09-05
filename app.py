@@ -355,12 +355,17 @@ _location_total = 0
 def _verify_location_token(req) -> bool:
     if not LOCATION_TOKEN:
         return False
+    import base64
     auth = req.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
         return hmac.compare_digest(auth[7:], LOCATION_TOKEN)
-    token_param = req.args.get("token", "")
-    if token_param:
-        return hmac.compare_digest(token_param, LOCATION_TOKEN)
+    if auth.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(auth[6:]).decode("utf-8")
+            _, password = decoded.split(":", 1)
+            return hmac.compare_digest(password, LOCATION_TOKEN)
+        except Exception:
+            return False
     return False
 
 
