@@ -291,7 +291,7 @@ def spending_notify():
         return "Forbidden", 403
     text = (
         request.args.get("text")
-        or (request.json or {}).get("text")
+        or (request.get_json(force=True, silent=True) or {}).get("text")
         or request.form.get("text")
         or ""
     )
