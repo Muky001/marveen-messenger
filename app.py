@@ -35,6 +35,8 @@ _pending_queue: list = []  # [{sender_id, text, ts}]
 _seen_mids: collections.deque = collections.deque(maxlen=200)  # dedup message IDs
 _sender_locks: dict[str, threading.Lock] = {}  # per-sender serialization
 _sender_locks_lock = threading.Lock()
+_spending_lock = threading.Lock()
+_spending_queue: list = []  # [{text, ts}] max 500 entries, in-memory only
 
 FUGE_SYSTEM_BASE = """Te FÜGE vagy (Felügyelő Üzenet Generáló Egység). Martin barátnőjével, Judittal kommunikálsz Messengeren.
 
@@ -276,6 +278,38 @@ def update_status():
     _martin_status.update(filtered)
     app.logger.info("status updated: %s", list(filtered.keys()))
     return "OK", 200
+
+
+@app.route("/spending-notify", methods=["GET", "POST"])
+def spending_notify():
+    """NotificationForwarder webhook endpoint. Accepts text as query param or JSON body."""
+    if not _verify_status_token(request):
+        return "Forbidden", 403
+    text = (
+        request.args.get("text")
+        or (request.json or {}).get("text")
+        or request.form.get("text")
+        or ""
+    )
+    if not text:
+        return "Bad request: missing text", 400
+    with _spending_lock:
+        _spending_queue.append({"text": text, "ts": time.time()})
+        if len(_spending_queue) > 500:
+            _spending_queue.pop(0)
+    app.logger.info("spending-notify queued: %s", text[:80])
+    return "OK", 200
+
+
+@app.route("/spending-poll", methods=["GET"])
+def spending_poll():
+    """Local poller fetches and clears queued spending notifications."""
+    if not _verify_status_token(request):
+        return "Forbidden", 403
+    with _spending_lock:
+        items = list(_spending_queue)
+        _spending_queue.clear()
+    return jsonify(items), 200
 
 
 @app.route("/privacy", methods=["GET"])
