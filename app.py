@@ -352,10 +352,11 @@ _location_lock = threading.Lock()
 _location_queue: list = []  # [{id, lat, lon, tst, acc, batt, vel, raw}] ack-based
 _location_total = 0
 
-def _verify_location_token(req) -> bool:
-    if not LOCATION_TOKEN:
-        return False
+def _verify_location_token(req):
+    """Returns True, 'not_configured', or False (wrong token)."""
     import base64
+    if not LOCATION_TOKEN:
+        return "not_configured"
     auth = req.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
         return hmac.compare_digest(auth[7:], LOCATION_TOKEN)
@@ -369,11 +370,17 @@ def _verify_location_token(req) -> bool:
     return False
 
 
+def _location_auth_response(result):
+    if result == "not_configured":
+        return "Service unavailable: LOCATION_TOKEN not set", 503
+    return "Unauthorized", 401
+
 @app.route("/location", methods=["POST"])
 def location_notify():
     """OwnTracks HTTP mode endpoint. Accepts _type=location payloads."""
-    if not _verify_location_token(request):
-        return "Forbidden", 403
+    r = _verify_location_token(request)
+    if r is not True:
+        return _location_auth_response(r)
     global _location_total
     body = request.get_json(force=True, silent=True) or {}
     if body.get("_type") != "location":
@@ -403,8 +410,9 @@ def location_notify():
 @app.route("/location-poll", methods=["GET"])
 def location_poll():
     """Fetch unacked location points."""
-    if not _verify_location_token(request):
-        return "Forbidden", 403
+    r = _verify_location_token(request)
+    if r is not True:
+        return _location_auth_response(r)
     with _location_lock:
         items = list(_location_queue)
         total = _location_total
@@ -414,8 +422,9 @@ def location_poll():
 @app.route("/location-ack", methods=["POST"])
 def location_ack():
     """Acknowledge processed location points by ID."""
-    if not _verify_location_token(request):
-        return "Forbidden", 403
+    r = _verify_location_token(request)
+    if r is not True:
+        return _location_auth_response(r)
     body = request.get_json(force=True, silent=True) or {}
     ids = body.get("ids", [])
     if isinstance(ids, str):
