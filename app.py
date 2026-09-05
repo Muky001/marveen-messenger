@@ -289,12 +289,19 @@ def spending_notify():
     """NotificationForwarder webhook endpoint. Accepts text as query param or JSON body."""
     if not _verify_status_token(request):
         return "Forbidden", 403
+    body = request.get_json(force=True, silent=True) or {}
     text = (
         request.args.get("text")
-        or (request.get_json(force=True, silent=True) or {}).get("text")
+        or body.get("text")
         or request.form.get("text")
         or ""
     )
+    # Also accept title+message separately: construct [title] message format
+    if not text:
+        title = (request.args.get("title") or body.get("title") or request.form.get("title") or "")
+        msg = (request.args.get("message") or body.get("message") or request.form.get("message") or "")
+        if title:
+            text = f"[{title}] {msg}".strip()
     if not text:
         return "Bad request: missing text", 400
     with _spending_lock:
