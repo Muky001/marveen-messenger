@@ -351,6 +351,7 @@ def spending_ack():
 _location_lock = threading.Lock()
 _location_queue: list = []  # [{id, lat, lon, tst, acc, batt, vel, raw}] ack-based
 _location_total = 0
+_location_request_flag = threading.Event()  # set by /location-request, cleared on next OwnTracks POST
 
 def _verify_location_token(req):
     """Returns True, 'not_configured', or False (wrong token)."""
@@ -385,6 +386,11 @@ def location_notify():
     body = request.get_json(force=True, silent=True) or {}
     if body.get("_type") != "location":
         return jsonify([]), 200  # OwnTracks expects [] response; non-location types silently ok
+    # On-demand refresh: if a /location-request is pending, ask OwnTracks to send another fix immediately.
+    cmd = []
+    if _location_request_flag.is_set():
+        _location_request_flag.clear()
+        cmd = [{"_type": "cmd", "action": "reportLocation"}]
     item_id = uuid.uuid4().hex
     item = {
         "id": item_id,
@@ -403,8 +409,19 @@ def location_notify():
         _location_queue.append(item)
         if len(_location_queue) > 1000:
             _location_queue.pop(0)
-    app.logger.info("location queued id=%s lat=%.4f lon=%.4f", item_id, item["lat"] or 0, item["lon"] or 0)
-    return jsonify([]), 200  # OwnTracks expects JSON array response
+    app.logger.info("location queued id=%s lat=%.4f lon=%.4f cmd=%s", item_id, item["lat"] or 0, item["lon"] or 0, cmd)
+    return jsonify(cmd), 200  # OwnTracks expects JSON array; cmd is [] or [reportLocation]
+
+
+@app.route("/location-request", methods=["POST"])
+def location_request():
+    """Request an immediate location fix from OwnTracks on its next POST to /location."""
+    r = _verify_location_token(request)
+    if r is not True:
+        return _location_auth_response(r)
+    _location_request_flag.set()
+    app.logger.info("location-request queued")
+    return jsonify({"queued": True}), 200
 
 
 @app.route("/location-poll", methods=["GET"])
