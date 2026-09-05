@@ -39,6 +39,7 @@ _sender_locks_lock = threading.Lock()
 _spending_lock = threading.Lock()
 _spending_queue: list = []  # [{id, text, ts}] max 500 entries, ack-based
 _spending_total = 0  # monotonic counter, resets on restart (that's the signal)
+_instance_id = uuid.uuid4().hex  # changes on every restart, regardless of total
 
 FUGE_SYSTEM_BASE = """Te FÜGE vagy (Felügyelő Üzenet Generáló Egység). Martin barátnőjével, Judittal kommunikálsz Messengeren.
 
@@ -326,7 +327,7 @@ def spending_poll():
     with _spending_lock:
         items = list(_spending_queue)
         total = _spending_total
-    return jsonify({"items": items, "total": total}), 200
+    return jsonify({"items": items, "total": total, "instance_id": _instance_id}), 200
 
 
 @app.route("/spending-ack", methods=["POST"])
